@@ -25,6 +25,8 @@ class BenchmarkComponent(wiring.Component):
     o_stream: Out(stream.Signature(8))
     o_flush:  Out(1)
     mode:     In(Mode)
+    rate_en:  In(1)
+    rate:     In(16)
     error:    Out(1)
     count:    Out(32)
 
@@ -41,6 +43,18 @@ class BenchmarkComponent(wiring.Component):
         m.submodules.lfsr = lfsr = EnableInserter(lfsr_en)(self.lfsr)
         m.d.comb += lfsr_word.eq(self.lfsr.value.word_select(self.count & 1, width=8))
 
+        rate_stb = Signal()
+        rate_count = Signal(self.rate.shape())
+
+        act = Signal()
+        with m.If(self.error):
+            m.d.comb += act.eq(0)
+        with m.Elif(self.rate_en):
+            m.d.sync += Cat(rate_count, rate_stb).eq(rate_count + self.rate + 1)
+            m.d.comb += act.eq(rate_stb)
+        with m.Else():
+            m.d.comb += act.eq(1)
+
         with m.FSM():
             with m.State("MODE"):
                 m.d.sync += self.count.eq(0)
@@ -53,38 +67,43 @@ class BenchmarkComponent(wiring.Component):
                         m.next = "LOOPBACK"
 
             with m.State("SOURCE"):
-                m.d.comb += [
-                    self.o_stream.payload.eq(lfsr_word),
-                    self.o_stream.valid.eq(1),
-                ]
-                with m.If(self.o_stream.ready):
-                    m.d.comb += [
-                        lfsr_en.eq(self.count & 1),
-                    ]
-                    m.d.sync += self.count.eq(self.count + 1)
+                with m.If(act):
+                    with m.If(self.o_stream.ready):
+                        m.d.comb += [
+                            lfsr_en.eq(self.count & 1),
+                            self.o_stream.valid.eq(1),
+                            self.o_stream.payload.eq(lfsr_word)
+                        ]
+                        m.d.sync += self.count.eq(self.count + 1)
+                    with m.Elif(self.rate_en):
+                        m.d.sync += self.error.eq(1)
 
             with m.State("SINK"):
-                with m.If(self.i_stream.valid):
-                    with m.If(self.i_stream.payload != lfsr_word):
+                with m.If(act):
+                    with m.If(self.i_stream.valid):
+                        with m.If(self.i_stream.payload != lfsr_word):
+                            m.d.sync += self.error.eq(1)
+                        m.d.comb += [
+                            self.i_stream.ready.eq(1),
+                            lfsr_en.eq(self.count & 1),
+                        ]
+                        m.d.sync += self.count.eq(self.count + 1)
+                    with m.Elif(self.rate_en & (self.count > 0)):
                         m.d.sync += self.error.eq(1)
-                    m.d.comb += [
-                        self.i_stream.ready.eq(1),
-                        lfsr_en.eq(self.count & 1),
-                    ]
-                    m.d.sync += self.count.eq(self.count + 1)
 
             with m.State("LOOPBACK"):
-                m.d.comb += [
-                    self.o_stream.payload.eq(self.i_stream.payload),
-                    self.o_stream.valid.eq(self.i_stream.valid),
-                    self.i_stream.ready.eq(self.o_stream.ready),
-                ]
-                with m.If(self.o_stream.ready & self.o_stream.valid):
-                    m.d.sync += self.count.eq(self.count + 1)
-                with m.Else():
+                with m.If(act):
                     m.d.comb += [
-                        self.o_flush.eq(1),
+                        self.o_stream.payload.eq(self.i_stream.payload),
+                        self.o_stream.valid.eq(self.i_stream.valid),
+                        self.i_stream.ready.eq(self.o_stream.ready),
                     ]
+                    with m.If(self.o_stream.ready & self.o_stream.valid):
+                        m.d.sync += self.count.eq(self.count + 1)
+                    with m.Elif(self.rate_en):
+                        m.d.sync += self.error.eq(1)
+                    with m.Else():
+                        m.d.comb += self.o_flush.eq(1)
 
         return m
 
@@ -120,9 +139,11 @@ class BenchmarkApplet(GlasgowAppletV2):
             component = self.assembly.add_submodule(BenchmarkComponent())
             self._pipe = self.assembly.add_inout_pipe(
                 component.o_stream, component.i_stream, in_flush=component.o_flush)
-            self._mode = self.assembly.add_rw_register(component.mode)
-            self._error = self.assembly.add_ro_register(component.error)
-            self._count = self.assembly.add_ro_register(component.count)
+            self._mode    = self.assembly.add_rw_register(component.mode)
+            self._rate_en = self.assembly.add_rw_register(component.rate_en)
+            self._rate    = self.assembly.add_rw_register(component.rate)
+            self._error   = self.assembly.add_ro_register(component.error)
+            self._count   = self.assembly.add_ro_register(component.count)
 
         sequence = array.array("H")
         sequence.extend(component.lfsr.generate())
