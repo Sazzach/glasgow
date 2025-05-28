@@ -161,11 +161,22 @@ class BenchmarkApplet(GlasgowAppletV2):
             dest="modes", metavar="MODE", type=str, nargs="*", choices=[[]] + cls.__all_modes,
             help="run benchmark mode MODE (default: {})".format(" ".join(cls.__all_modes)))
 
+        rate_group = parser.add_mutually_exclusive_group()
+
+        rate_group.add_argument(
+            "--rate", dest="rate_mibps", metavar="RATE", type=float,
+            help="set device to source/sink data at constant RATE MiB/s and report FIFO over/underflows")
+
+        # TODO rate-search doesn't make sense for latency test, how to handle for run all?
+        rate_group.add_argument(
+            "--rate-search", action="store_true",
+            help="search for the fastest constant rate that data can be sourced/sunk without a FIFO over/underflow")
+
     async def run(self, args):
         golden = bytearray()
         while len(golden) < args.count:
             golden += self._sequence[:args.count - len(golden)]
-
+        
         # These requests are essentially free, as the data and control requests are independent,
         # both on the FX2 and on the USB bus.
         async def counter():
@@ -177,51 +188,42 @@ class BenchmarkApplet(GlasgowAppletV2):
         for mode in args.modes or self.__all_modes:
             self.logger.info("running benchmark mode %s for %.3f MiB",
                              mode, len(golden) / (1 << 20))
-
-            if mode == "source":
-                await self._pipe.reset()
-                await self._mode.set(Mode.SOURCE.value)
-
-                counter_fut = asyncio.ensure_future(counter())
-                begin  = time.time()
-                actual = await self._pipe.recv(len(golden))
-                end    = time.time()
-                length = len(golden)
-                counter_fut.cancel()
-
-                error = (actual != golden)
-                count = None
-
-            if mode == "sink":
-                await self._pipe.reset()
-                await self._mode.set(Mode.SINK.value)
-
-                counter_fut = asyncio.ensure_future(counter())
-                begin  = time.time()
-                await self._pipe.send(golden)
-                await self._pipe.flush()
-                end    = time.time()
-                length = len(golden)
-                counter_fut.cancel()
-
-                error = bool(await self._error)
-                count = await self._count
-
-            if mode == "loopback":
+            
+            if mode in ("source", "sink", "loopback"):
+                await self._mode.set(Mode[mode.upper()].value)
                 await self._pipe.reset()
                 await self._mode.set(Mode.LOOPBACK.value)
                 counter_fut = asyncio.ensure_future(counter())
-
                 begin  = time.time()
-                await self._pipe.send(golden)
-                await self._pipe.flush()
-                actual = await self._pipe.recv(len(golden))
-                end    = time.time()
-                length = len(golden) * 2
-                counter_fut.cancel()
 
-                error = (actual != golden)
-                count = None
+                if mode == "source":
+                    actual = await self._pipe.recv(len(golden))
+                    end    = time.time()
+                    length = len(golden)
+
+                    error = (actual != golden)
+                    count = None
+
+                if mode == "sink":
+                    await self._pipe.send(golden)
+                    await self._pipe.flush()
+                    end    = time.time()
+                    length = len(golden)
+
+                    error = bool(await self._error)
+                    count = await self._count
+
+                if mode == "loopback":
+                    await self._pipe.send(golden)
+                    await self._pipe.flush()
+                    actual = await self._pipe.recv(len(golden))
+                    end    = time.time()
+                    length = len(golden) * 2
+
+                    error = (actual != golden)
+                    count = None
+
+                counter_fut.cancel()
 
             if mode == "latency":
                 packetmax = golden[:512]
