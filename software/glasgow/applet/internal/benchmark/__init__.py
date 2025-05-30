@@ -14,6 +14,9 @@ from glasgow.gateware.lfsr import LinearFeedbackShiftRegister
 from glasgow.applet import GlasgowAppletV2
 
 
+RATE_WIDTH_TODO = 10
+
+
 class Mode(enum.Enum):
     SOURCE   = 1
     SINK     = 2
@@ -26,7 +29,7 @@ class BenchmarkComponent(wiring.Component):
     o_flush:  Out(1)
     mode:     In(Mode)
     rate_en:  In(1)
-    rate:     In(16)
+    rate:     In(RATE_WIDTH_TODO)
     error:    Out(1)
     count:    Out(32)
 
@@ -77,6 +80,12 @@ class BenchmarkComponent(wiring.Component):
                         m.d.sync += self.count.eq(self.count + 1)
                     with m.Elif(self.rate_en):
                         m.d.sync += self.error.eq(1)
+                with m.Elif(self.rate_en & self.error):
+                    # Source dummy data to end pending read
+                    m.d.comb += [
+                        self.o_stream.valid.eq(1),
+                        self.o_stream.payload.eq(0)
+                    ]
 
             with m.State("SINK"):
                 with m.If(act):
@@ -90,6 +99,9 @@ class BenchmarkComponent(wiring.Component):
                         m.d.sync += self.count.eq(self.count + 1)
                     with m.Elif(self.rate_en & (self.count > 0)):
                         m.d.sync += self.error.eq(1)
+                with m.Elif(self.rate_en & self.error):
+                    # Sink data to end pending flush
+                    m.d.comb += self.i_stream.ready.eq(1)
 
             with m.State("LOOPBACK"):
                 with m.If(act):
@@ -100,10 +112,17 @@ class BenchmarkComponent(wiring.Component):
                     ]
                     with m.If(self.o_stream.ready & self.o_stream.valid):
                         m.d.sync += self.count.eq(self.count + 1)
-                    with m.Elif(self.rate_en):
+                    with m.Elif(self.rate_en & (self.count > 0)):
                         m.d.sync += self.error.eq(1)
                     with m.Else():
                         m.d.comb += self.o_flush.eq(1)
+                with m.Elif(self.rate_en & self.error):
+                    # Sink/source data to end pending flush/read
+                    m.d.comb += [
+                        self.i_stream.ready.eq(1),
+                        self.o_stream.valid.eq(1),
+                        self.o_stream.payload.eq(0)
+                    ]
 
         return m
 
@@ -176,7 +195,7 @@ class BenchmarkApplet(GlasgowAppletV2):
         golden = bytearray()
         while len(golden) < args.count:
             golden += self._sequence[:args.count - len(golden)]
-        
+
         # These requests are essentially free, as the data and control requests are independent,
         # both on the FX2 and on the USB bus.
         async def counter():
@@ -188,11 +207,13 @@ class BenchmarkApplet(GlasgowAppletV2):
         for mode in args.modes or self.__all_modes:
             self.logger.info("running benchmark mode %s for %.3f MiB",
                              mode, len(golden) / (1 << 20))
-            
+
             if mode in ("source", "sink", "loopback"):
+                if args.rate_mibps is not None:
+                    await self._rate.set(self._mibps_to_rate(args.rate_mibps))
+                    await self._rate_en.set(1)
                 await self._mode.set(Mode[mode.upper()].value)
                 await self._pipe.reset()
-                await self._mode.set(Mode.LOOPBACK.value)
                 counter_fut = asyncio.ensure_future(counter())
                 begin  = time.time()
 
@@ -231,8 +252,9 @@ class BenchmarkApplet(GlasgowAppletV2):
                 error = False
                 roundtriptime = []
 
-                await self._pipe.reset()
+                await self._rate_en.set(0)
                 await self._mode.set(Mode.LOOPBACK.value)
+                await self._pipe.reset()
                 counter_fut = asyncio.ensure_future(counter())
 
                 while count < args.count:
@@ -268,6 +290,12 @@ class BenchmarkApplet(GlasgowAppletV2):
                                  mode,
                                  (length / (end - begin)) / (1 << 20),
                                  (length / (end - begin)) / (1 << 17))
+
+    def _mibps_to_rate(self, mibps):
+        ret = round(mibps*(1<<RATE_WIDTH_TODO)/(48)) - 1
+        ret = min(max(ret, 0), (1<<RATE_WIDTH_TODO)-1)
+        print(ret)
+        return ret
 
     @classmethod
     def tests(cls):
