@@ -30,6 +30,7 @@ class BenchmarkComponent(wiring.Component):
     mode:     In(Mode)
     rate_en:  In(1)
     rate:     In(RATE_WIDTH_TODO)
+    stall:    Out(1)
     error:    Out(1)
     count:    Out(32)
 
@@ -79,7 +80,10 @@ class BenchmarkComponent(wiring.Component):
                         ]
                         m.d.sync += self.count.eq(self.count + 1)
                     with m.Elif(self.rate_en):
-                        m.d.sync += self.error.eq(1)
+                        m.d.sync += [
+                            self.error.eq(1),
+                            self.stall.eq(1)
+                        ]
                 with m.Elif(self.rate_en & self.error):
                     # Source dummy data to end pending read
                     m.d.comb += [
@@ -98,7 +102,10 @@ class BenchmarkComponent(wiring.Component):
                         ]
                         m.d.sync += self.count.eq(self.count + 1)
                     with m.Elif(self.rate_en & (self.count > 0)):
-                        m.d.sync += self.error.eq(1)
+                        m.d.sync += [
+                            self.error.eq(1),
+                            self.stall.eq(1)
+                        ]
                 with m.Elif(self.rate_en & self.error):
                     # Sink data to end pending flush
                     m.d.comb += self.i_stream.ready.eq(1)
@@ -113,7 +120,10 @@ class BenchmarkComponent(wiring.Component):
                     with m.If(self.o_stream.ready & self.o_stream.valid):
                         m.d.sync += self.count.eq(self.count + 1)
                     with m.Elif(self.rate_en & (self.count > 0)):
-                        m.d.sync += self.error.eq(1)
+                        m.d.sync += [
+                            self.error.eq(1),
+                            self.stall.eq(1)
+                        ]
                     with m.Else():
                         m.d.comb += self.o_flush.eq(1)
                 with m.Elif(self.rate_en & self.error):
@@ -190,6 +200,38 @@ class BenchmarkApplet(GlasgowAppletV2):
         rate_group.add_argument(
             "--rate-search", action="store_true",
             help="search for the fastest constant rate that data can be sourced/sunk without a FIFO over/underflow")
+    
+    async def source(self, golden, *, end_length=None, end_duration=None):
+        length = 0
+        begin = time.time()
+        while True:
+            actual = await self._pipe.recv(len(golden))
+            duration = time.time() - begin
+            length += len(golden)
+            error = (actual != golden)
+            if error:
+                break
+            elif end_length is not None and end_length >= length:
+                break
+            elif end_duration is not None and end_duration >= duration:
+                break
+        return (error, length, duration)
+    
+    async def sink(self, golden, *, end_length=None, end_duration=None):
+        length = 0
+        begin = time.time()
+        # TODO poll error? (need for indefinite mode)
+        while True:
+            await self._pipe.send(golden)
+            duration = time.time() - begin
+            length += len(golden)
+            if end_length is not None and end_length >= length:
+                await self._pipe.flush()
+                duration = time.time() - begin
+                break
+            elif end_duration is not None and end_duration >= duration:
+                break
+        return (None, length, duration)
 
     async def run(self, args):
         golden = bytearray()
@@ -218,30 +260,23 @@ class BenchmarkApplet(GlasgowAppletV2):
                 begin  = time.time()
 
                 if mode == "source":
-                    actual = await self._pipe.recv(len(golden))
-                    end    = time.time()
-                    length = len(golden)
-
-                    error = (actual != golden)
-                    count = None
+                    error, length, duration = await self.source(golden, end_length=len(golden))
+                    count = 0 # TODO
 
                 if mode == "sink":
-                    await self._pipe.send(golden)
-                    await self._pipe.flush()
-                    end    = time.time()
-                    length = len(golden)
-
+                    error, length, duration = await self.sink(golden, end_length=len(golden))
+                    # TODO error/count
                     error = bool(await self._error)
                     count = await self._count
 
                 if mode == "loopback":
-                    await self._pipe.send(golden)
-                    await self._pipe.flush()
-                    actual = await self._pipe.recv(len(golden))
-                    end    = time.time()
-                    length = len(golden) * 2
+                    asdf = await asyncio.gather(
+                        self.source(golden, end_length=len(golden)),
+                        self.sink(golden, end_length=len(golden))
+                    )
+                    error, length, duration = asdf[1]
+                    length *= 2
 
-                    error = (actual != golden)
                     count = None
 
                 counter_fut.cancel()
@@ -288,8 +323,8 @@ class BenchmarkApplet(GlasgowAppletV2):
                 else:
                     self.logger.info("mode %s: %.2f MiB/s (%.2f Mb/s)",
                                  mode,
-                                 (length / (end - begin)) / (1 << 20),
-                                 (length / (end - begin)) / (1 << 17))
+                                 (length / (duration)) / (1 << 20),
+                                 (length / (duration)) / (1 << 17))
 
     def _mibps_to_rate(self, mibps):
         ret = round(mibps*(1<<RATE_WIDTH_TODO)/(48)) - 1
