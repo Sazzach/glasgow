@@ -167,7 +167,8 @@ class BenchmarkApplet(GlasgowAppletV2):
         with self.assembly.add_applet(self):
             component = self.assembly.add_submodule(BenchmarkComponent())
             self._pipe = self.assembly.add_inout_pipe(
-                component.o_stream, component.i_stream, in_flush=component.o_flush)
+                component.o_stream, component.i_stream, in_flush=component.o_flush,
+                out_buffer_size=10) # TODO out_buffer_size doesn't act like expected?
             self._mode    = self.assembly.add_rw_register(component.mode)
             self._rate_en = self.assembly.add_rw_register(component.rate_en)
             self._rate    = self.assembly.add_rw_register(component.rate)
@@ -182,9 +183,19 @@ class BenchmarkApplet(GlasgowAppletV2):
 
     @classmethod
     def add_run_arguments(cls, parser):
-        parser.add_argument(
+        length_group = parser.add_mutually_exclusive_group()
+
+        length_group.add_argument(
             "-c", "--count", metavar="COUNT", type=int, default=1 << 23,
             help="transfer COUNT bytes (default: %(default)s)")
+        
+        length_group.add_argument(
+            "-d", "--duration", metavar="DURATION", type=float,
+            help="transfer for DURATION")
+        
+        length_group.add_argument(
+            "--until-error", action="store_true",
+            help="run mode(s) until an error occurs (or CTRL-C)")
 
         parser.add_argument(
             dest="modes", metavar="MODE", type=str, nargs="*", choices=[[]] + cls.__all_modes,
@@ -201,7 +212,7 @@ class BenchmarkApplet(GlasgowAppletV2):
             "--rate-search", action="store_true",
             help="search for the fastest constant rate that data can be sourced/sunk without a FIFO over/underflow")
     
-    async def source(self, golden, *, end_length=None, end_duration=None):
+    async def source_io(self, golden, end_length=None, end_duration=None):
         length = 0
         begin = time.time()
         while True:
@@ -211,13 +222,13 @@ class BenchmarkApplet(GlasgowAppletV2):
             error = (actual != golden)
             if error:
                 break
-            elif end_length is not None and end_length >= length:
+            elif end_length is not None and end_length <= length:
                 break
-            elif end_duration is not None and end_duration >= duration:
+            elif end_duration is not None and end_duration <= duration:
                 break
         return (error, length, duration)
     
-    async def sink(self, golden, *, end_length=None, end_duration=None):
+    async def sink_io(self, golden, end_length=None, end_duration=None):
         length = 0
         begin = time.time()
         # TODO poll error? (need for indefinite mode)
@@ -225,30 +236,52 @@ class BenchmarkApplet(GlasgowAppletV2):
             await self._pipe.send(golden)
             duration = time.time() - begin
             length += len(golden)
-            if end_length is not None and end_length >= length:
+            if end_length is not None and end_length <= length:
                 await self._pipe.flush()
                 duration = time.time() - begin
                 break
-            elif end_duration is not None and end_duration >= duration:
+            elif end_duration is not None and end_duration <= duration:
+                length = await self._count
+                duration = time.time() - begin
                 break
         return (None, length, duration)
 
     async def run(self, args):
-        golden = bytearray()
-        while len(golden) < args.count:
-            golden += self._sequence[:args.count - len(golden)]
+        end_length = None
+        end_duration = None
+        if args.duration is not None:
+            golden = self._sequence
+            # TODO if duration * rate < len(_sequence)
+            end_duration = args.duration
+        elif args.until_error:
+            golden = self._sequence
+        else:
+            golden = bytearray()
+            while len(golden) < args.count:
+                golden += self._sequence[:args.count - len(golden)]
+            end_length = args.count
 
+        # TODO delete comment?
         # These requests are essentially free, as the data and control requests are independent,
         # both on the FX2 and on the USB bus.
         async def counter():
             while True:
                 await asyncio.sleep(0.1)
                 count = await self._count
-                self.logger.debug("transferred %#x/%#x", count, args.count)
+                if args.duration is not None:
+                    self.logger.debug("transferred %#x", count)
+                else:
+                    self.logger.debug("transferred %#x/%#x", count, args.count)
 
         for mode in args.modes or self.__all_modes:
-            self.logger.info("running benchmark mode %s for %.3f MiB",
-                             mode, len(golden) / (1 << 20))
+            if args.duration is not None:
+                length_val = args.duration
+                unit_str = "s"
+            else:
+                length_val = len(golden) / (1 << 20)
+                unit_str = "MiB"
+            self.logger.info("running benchmark mode %s for %.3f %s",
+                             mode, length_val, unit_str)
 
             if mode in ("source", "sink", "loopback"):
                 if args.rate_mibps is not None:
@@ -257,22 +290,21 @@ class BenchmarkApplet(GlasgowAppletV2):
                 await self._mode.set(Mode[mode.upper()].value)
                 await self._pipe.reset()
                 counter_fut = asyncio.ensure_future(counter())
-                begin  = time.time()
 
                 if mode == "source":
-                    error, length, duration = await self.source(golden, end_length=len(golden))
+                    error, length, duration = await self.source_io(golden, end_length, end_duration)
                     count = 0 # TODO
 
                 if mode == "sink":
-                    error, length, duration = await self.sink(golden, end_length=len(golden))
+                    error, length, duration = await self.sink_io(golden, end_length, end_duration)
                     # TODO error/count
                     error = bool(await self._error)
                     count = await self._count
 
                 if mode == "loopback":
                     asdf = await asyncio.gather(
-                        self.source(golden, end_length=len(golden)),
-                        self.sink(golden, end_length=len(golden))
+                        self.source_io(golden, end_length=len(golden)),
+                        self.sink_io(golden, end_length=len(golden))
                     )
                     error, length, duration = asdf[1]
                     length *= 2
@@ -292,7 +324,8 @@ class BenchmarkApplet(GlasgowAppletV2):
                 await self._pipe.reset()
                 counter_fut = asyncio.ensure_future(counter())
 
-                while count < args.count:
+                latency_begin = time.time()
+                while True:
                     begin = time.perf_counter()
                     await self._pipe.send(packetmax)
                     await self._pipe.flush()
@@ -305,6 +338,12 @@ class BenchmarkApplet(GlasgowAppletV2):
                         error = True
                         break
                     count += len(packetmax) * 2
+
+                    if end_duration is not None:
+                        if end_duration <= time.time() - latency_begin:
+                            break
+                    elif count < args.count:
+                        break
 
                 counter_fut.cancel()
 
@@ -329,7 +368,6 @@ class BenchmarkApplet(GlasgowAppletV2):
     def _mibps_to_rate(self, mibps):
         ret = round(mibps*(1<<RATE_WIDTH_TODO)/(48)) - 1
         ret = min(max(ret, 0), (1<<RATE_WIDTH_TODO)-1)
-        print(ret)
         return ret
 
     @classmethod
