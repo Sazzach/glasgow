@@ -47,17 +47,22 @@ class BenchmarkComponent(wiring.Component):
         m.submodules.lfsr = lfsr = EnableInserter(lfsr_en)(self.lfsr)
         m.d.comb += lfsr_word.eq(self.lfsr.value.word_select(self.count & 1, width=8))
 
-        rate_stb = Signal()
         rate_count = Signal(self.rate.shape())
 
         act = Signal()
         with m.If(self.error):
-            m.d.comb += act.eq(0)
+            m.d.sync += act.eq(0)
         with m.Elif(self.rate_en):
-            m.d.sync += Cat(rate_count, rate_stb).eq(rate_count + self.rate + 1)
-            m.d.comb += act.eq(rate_stb)
+            res = rate_count + self.rate + 1
+            m.d.sync += rate_count.eq(res)
+            with m.If(res[len(rate_count)]):
+                with m.If(act):
+                    self.error.eq(1)
+                    self.stall.eq(1)
+                with m.Else():
+                    m.d.sync += act.eq(1)
         with m.Else():
-            m.d.comb += act.eq(1)
+            m.d.sync += act.eq(1)
 
         with m.FSM():
             with m.State("MODE"):
@@ -72,18 +77,15 @@ class BenchmarkComponent(wiring.Component):
 
             with m.State("SOURCE"):
                 with m.If(act):
+                    m.d.comb += [
+                        self.o_stream.payload.eq(lfsr_word),
+                        self.o_stream.valid.eq(1),
+                    ]
                     with m.If(self.o_stream.ready):
-                        m.d.comb += [
-                            lfsr_en.eq(self.count & 1),
-                            self.o_stream.valid.eq(1),
-                            self.o_stream.payload.eq(lfsr_word)
-                        ]
+                        m.d.comb += lfsr_en.eq(self.count & 1)
                         m.d.sync += self.count.eq(self.count + 1)
-                    with m.Elif(self.rate_en):
-                        m.d.sync += [
-                            self.error.eq(1),
-                            self.stall.eq(1)
-                        ]
+                        with m.If(self.rate_en):
+                            m.d.sync += act.eq(0)
                 with m.Elif(self.rate_en & self.error):
                     # Source dummy data to end pending read
                     m.d.comb += [
@@ -100,7 +102,9 @@ class BenchmarkComponent(wiring.Component):
                             self.i_stream.ready.eq(1),
                             lfsr_en.eq(self.count & 1),
                         ]
-                        m.d.sync += self.count.eq(self.count + 1)
+                        m.d.sync += self.count.eq(self.count + 1),
+                        with m.If(self.rate_en):
+                            m.d.sync += act.eq(0)
                     with m.Elif(self.rate_en & (self.count > 0)):
                         m.d.sync += [
                             self.error.eq(1),
@@ -118,6 +122,8 @@ class BenchmarkComponent(wiring.Component):
                         self.i_stream.ready.eq(self.o_stream.ready),
                     ]
                     with m.If(self.o_stream.ready & self.o_stream.valid):
+                        with m.If(self.rate_en):
+                            m.d.sync += act.eq(0)
                         m.d.sync += self.count.eq(self.count + 1)
                     with m.Elif(self.rate_en & (self.count > 0)):
                         m.d.sync += [
@@ -228,15 +234,17 @@ class BenchmarkApplet(GlasgowAppletV2):
                 break
         return (error, length, duration)
     
-    async def sink_io(self, golden, end_length=None, end_duration=None):
+    async def sink_io(self, golden, end_length=None, end_duration=None, monitor_fut=None):
         length = 0
         begin = time.time()
-        # TODO poll error? (need for indefinite mode)
         while True:
             await self._pipe.send(golden)
             duration = time.time() - begin
             length += len(golden)
-            if end_length is not None and end_length <= length:
+            if monitor_fut is not None and monitor_fut.done():
+                # TODO what goes here?
+                break
+            elif end_length is not None and end_length <= length:
                 await self._pipe.flush()
                 duration = time.time() - begin
                 break
@@ -261,12 +269,14 @@ class BenchmarkApplet(GlasgowAppletV2):
                 golden += self._sequence[:args.count - len(golden)]
             end_length = args.count
 
-        # TODO delete comment?
         # These requests are essentially free, as the data and control requests are independent,
         # both on the FX2 and on the USB bus.
-        async def counter():
+        # TODO monitor back to counter + make async error thing for sink
+        async def monitor():
             while True:
                 await asyncio.sleep(0.1)
+                if await bool(self._error):
+                    return
                 count = await self._count
                 if args.duration is not None:
                     self.logger.debug("transferred %#x", count)
@@ -289,29 +299,36 @@ class BenchmarkApplet(GlasgowAppletV2):
                     await self._rate_en.set(1)
                 await self._mode.set(Mode[mode.upper()].value)
                 await self._pipe.reset()
-                counter_fut = asyncio.ensure_future(counter())
+                #print("reset!")
+                asdf = time.time()
+                monitor_fut = asyncio.ensure_future(monitor())
 
                 if mode == "source":
+                    #print("asdf:", time.time() - asdf)
                     error, length, duration = await self.source_io(golden, end_length, end_duration)
                     count = 0 # TODO
+                    count = await self._count
+                    #print("ovf: ", await self._overflow)
 
+                # TODO "overflowing after finish (actually good)"
                 if mode == "sink":
-                    error, length, duration = await self.sink_io(golden, end_length, end_duration)
+                    error, length, duration = await self.sink_io(golden, end_length, end_duration, monitor_fut)
                     # TODO error/count
                     error = bool(await self._error)
                     count = await self._count
 
+                # TODO 2x rate??
                 if mode == "loopback":
-                    asdf = await asyncio.gather(
-                        self.source_io(golden, end_length=len(golden)),
-                        self.sink_io(golden, end_length=len(golden))
+                    asdf_TODO = await asyncio.gather(
+                        self.source_io(golden, end_length, end_duration),
+                        self.sink_io(golden, end_length, end_duration, monitor_fut)
                     )
-                    error, length, duration = asdf[1]
+                    error, length, duration = asdf_TODO[1]
                     length *= 2
 
                     count = None
 
-                counter_fut.cancel()
+                monitor_fut.cancel()
 
             if mode == "latency":
                 packetmax = golden[:512]
@@ -322,7 +339,7 @@ class BenchmarkApplet(GlasgowAppletV2):
                 await self._rate_en.set(0)
                 await self._mode.set(Mode.LOOPBACK.value)
                 await self._pipe.reset()
-                counter_fut = asyncio.ensure_future(counter())
+                monitor_fut = asyncio.ensure_future(monitor())
 
                 latency_begin = time.time()
                 while True:
@@ -345,7 +362,7 @@ class BenchmarkApplet(GlasgowAppletV2):
                     elif count < args.count:
                         break
 
-                counter_fut.cancel()
+                monitor_fut.cancel()
 
             if error:
                 if count is None:
