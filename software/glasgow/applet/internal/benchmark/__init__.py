@@ -4,20 +4,19 @@ import struct
 import array
 import time
 import statistics
-import enum
+import enum # TODO amaranth enum?
+import itertools
 
 from amaranth import *
 from amaranth.lib import wiring, stream
 from amaranth.lib.wiring import In, Out
 
 from glasgow.gateware.lfsr import LinearFeedbackShiftRegister
+from glasgow.abstract import AbstractAssembly
 from glasgow.applet import GlasgowAppletV2
 
 
-RATE_WIDTH_TODO = 10
-
-
-class Mode(enum.Enum):
+class Mode(enum.IntEnum):
     SOURCE   = 1
     SINK     = 2
     LOOPBACK = 3
@@ -29,7 +28,7 @@ class BenchmarkComponent(wiring.Component):
     o_flush:  Out(1)
     mode:     In(Mode)
     rate_en:  In(1)
-    rate:     In(RATE_WIDTH_TODO)
+    rate:     In(10)
     stall:    Out(1)
     error:    Out(1)
     count:    Out(32)
@@ -50,9 +49,10 @@ class BenchmarkComponent(wiring.Component):
         rate_count = Signal(self.rate.shape())
 
         act = Signal()
-        with m.If(self.error):
-            m.d.sync += act.eq(0)
-        with m.Elif(self.rate_en):
+        #with m.If(self.error):
+            #m.d.sync += act.eq(0)
+        #with m.Elif(self.rate_en):
+        with m.If(self.rate_en):
             res = rate_count + self.rate + 1
             m.d.sync += rate_count.eq(res)
             with m.If(res[len(rate_count)]):
@@ -143,6 +143,159 @@ class BenchmarkComponent(wiring.Component):
         return m
 
 
+class BenchmarkInterface:
+    def __init__(self, logger: logging.Logger, assembly: AbstractAssembly):
+        self._logger   = logger
+        self._level    = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
+        self._assembly = assembly
+
+        component = assembly.add_submodule(BenchmarkComponent())
+        self._pipe = assembly.add_inout_pipe(
+            component.o_stream, component.i_stream, in_flush=component.o_flush,
+            out_buffer_size=int(1e6)) # TODO out_buffer_size doesn't act like expected?
+        self._mode    = assembly.add_rw_register(component.mode)
+        self._rate_en = assembly.add_rw_register(component.rate_en)
+        self._rate    = assembly.add_rw_register(component.rate)
+        self._error   = assembly.add_ro_register(component.error)
+        self._count   = assembly.add_ro_register(component.count)
+
+        sequence = array.array("H")
+        sequence.extend(component.lfsr.generate())
+        if struct.pack("H", 0x1234) != struct.pack("<H", 0x1234):
+            sequence.byteswap()
+        self._sequence = sequence.tobytes()
+    
+    async def source(self, *, length=None, duration=None):
+        golden = self._make_golden(length)
+        await self._pipe.reset()
+        await self._mode.set(Mode.SOURCE)
+        return await self.source_io(golden, length, duration)
+    
+    async def sink(self, *, length=None, duration=None):
+        golden = self._make_golden(length)
+        await self._pipe.reset()
+        await self._mode.set(Mode.SINK)
+        return await self.sink_io(golden, length, duration)
+    
+    async def test(self):
+        await self._mode.set(Mode.SOURCE)
+        print(await self._pipe.send(self._make_golden(10)))
+        print(await self._pipe.send(self._make_golden(10)))
+
+    async def loopback(self, *, length=None, duration=None):
+        golden = self._make_golden(length)
+        await self._pipe.reset()
+        await self._mode.set(Mode.LOOPBACK)
+        result = await asyncio.gather(
+            self.source_io(golden, length, duration),
+            self.sink_io(golden, length, duration)
+        )
+        error, length, duration = result[1]
+        length *= 2
+        return error, length, duration
+
+    async def latency(self, samples=None, duration=None):
+        packetmax = self._make_golden(512)
+        count = 0
+        error = False
+        roundtriptime = []
+
+        await self._pipe.reset()
+        await self._mode.set(Mode.LOOPBACK.value)
+        #counter_fut = asyncio.ensure_future(counter())
+
+        latency_begin = time.time()
+        while True:
+            if duration is not None:
+                if time.time() - latency_begin >= duration:
+                    break
+            elif count >= samples:
+                break
+
+            begin = time.perf_counter()
+            await self._pipe.send(packetmax)
+            await self._pipe.flush()
+            actual = await self._pipe.recv(len(packetmax))
+            end = time.perf_counter()
+
+            # calculate roundtrip time in µs
+            roundtriptime.append((end - begin) * 1000000)
+            if actual != packetmax:
+                error = True
+                break
+            count += 1
+        return error, roundtriptime
+
+    def _make_golden(self, length):
+        golden = bytearray()
+        while len(golden) < length:
+            golden += self._sequence[:length - len(golden)]
+        return golden
+
+    # These requests are essentially free, as the data and control requests are independent,
+    # both on the FX2 and on the USB bus.
+    async def _counter():
+        while True:
+            await asyncio.sleep(0.1)
+            count = await self._count
+            if args.duration is not None:
+                self.logger.debug("transferred %#x", count)
+            else:
+                self.logger.debug("transferred %#x/%#x", count, args.count)
+
+    def _mibps_to_rate(self, mibps):
+        rate_width = self._rate.shape.width
+        mbps = mibps * (48 * (1 << 20)) / 48e6
+        ret = round(mbps*(1<<rate_width)/48) - 1
+        ret = min(max(ret, 0), (1<<rate_width)-1)
+        return ret
+
+    async def source_io(self, golden, end_length=None, end_duration=None):
+        length = 0
+        begin = time.time()
+        while True:
+            actual = await self._pipe.recv(len(golden))
+            duration = time.time() - begin
+            length += len(golden)
+            error = (actual != golden)
+            if error:
+                break
+            elif end_length is not None and end_length <= length:
+                break
+            elif end_duration is not None and end_duration <= duration:
+                break
+        return (error, length, duration)
+    
+    async def sink_io(self, golden, end_length=None, end_duration=None):
+        async def error_monitor():
+            return
+            #while not bool(await self._error):
+                #await asyncio.sleep(0.1)
+        
+        monitor_fut = asyncio.ensure_future(error_monitor())
+
+        length = 0
+        begin = time.time()
+        while True:
+            await self._pipe.send(golden)
+            duration = time.time() - begin
+            length += len(golden)
+            if monitor_fut.done():
+                # TODO what goes here?
+                break
+            elif end_length is not None and end_length <= length:
+                await self._pipe.flush()
+                duration = time.time() - begin
+                break
+            elif end_duration is not None and end_duration <= duration:
+                length = await self._count
+                duration = time.time() - begin
+                break
+        
+        monitor_fut.cancel()
+        return (None, length, duration)
+
+
 class BenchmarkApplet(GlasgowAppletV2):
     logger = logging.getLogger(__name__)
     help = "evaluate communication performance"
@@ -171,21 +324,7 @@ class BenchmarkApplet(GlasgowAppletV2):
 
     def build(self, args):
         with self.assembly.add_applet(self):
-            component = self.assembly.add_submodule(BenchmarkComponent())
-            self._pipe = self.assembly.add_inout_pipe(
-                component.o_stream, component.i_stream, in_flush=component.o_flush,
-                out_buffer_size=10) # TODO out_buffer_size doesn't act like expected?
-            self._mode    = self.assembly.add_rw_register(component.mode)
-            self._rate_en = self.assembly.add_rw_register(component.rate_en)
-            self._rate    = self.assembly.add_rw_register(component.rate)
-            self._error   = self.assembly.add_ro_register(component.error)
-            self._count   = self.assembly.add_ro_register(component.count)
-
-        sequence = array.array("H")
-        sequence.extend(component.lfsr.generate())
-        if struct.pack("H", 0x1234) != struct.pack("<H", 0x1234):
-            sequence.byteswap()
-        self._sequence = sequence.tobytes()
+            self.benchmark_iface = BenchmarkInterface(self.logger, self.assembly)
 
     @classmethod
     def add_run_arguments(cls, parser):
@@ -194,11 +333,11 @@ class BenchmarkApplet(GlasgowAppletV2):
         length_group.add_argument(
             "-c", "--count", metavar="COUNT", type=int, default=1 << 23,
             help="transfer COUNT bytes (default: %(default)s)")
-        
+
         length_group.add_argument(
             "-d", "--duration", metavar="DURATION", type=float,
             help="transfer for DURATION")
-        
+
         length_group.add_argument(
             "--until-error", action="store_true",
             help="run mode(s) until an error occurs (or CTRL-C)")
@@ -207,168 +346,42 @@ class BenchmarkApplet(GlasgowAppletV2):
             dest="modes", metavar="MODE", type=str, nargs="*", choices=[[]] + cls.__all_modes,
             help="run benchmark mode MODE (default: {})".format(" ".join(cls.__all_modes)))
 
-        rate_group = parser.add_mutually_exclusive_group()
-
-        rate_group.add_argument(
+        parser.add_argument(
             "--rate", dest="rate_mibps", metavar="RATE", type=float,
             help="set device to source/sink data at constant RATE MiB/s and report FIFO over/underflows")
 
-        # TODO rate-search doesn't make sense for latency test, how to handle for run all?
-        rate_group.add_argument(
-            "--rate-search", action="store_true",
-            help="search for the fastest constant rate that data can be sourced/sunk without a FIFO over/underflow")
-    
-    async def source_io(self, golden, end_length=None, end_duration=None):
-        length = 0
-        begin = time.time()
-        while True:
-            actual = await self._pipe.recv(len(golden))
-            duration = time.time() - begin
-            length += len(golden)
-            error = (actual != golden)
-            if error:
-                break
-            elif end_length is not None and end_length <= length:
-                break
-            elif end_duration is not None and end_duration <= duration:
-                break
-        return (error, length, duration)
-    
-    async def sink_io(self, golden, end_length=None, end_duration=None, monitor_fut=None):
-        length = 0
-        begin = time.time()
-        while True:
-            await self._pipe.send(golden)
-            duration = time.time() - begin
-            length += len(golden)
-            if monitor_fut is not None and monitor_fut.done():
-                # TODO what goes here?
-                break
-            elif end_length is not None and end_length <= length:
-                await self._pipe.flush()
-                duration = time.time() - begin
-                break
-            elif end_duration is not None and end_duration <= duration:
-                length = await self._count
-                duration = time.time() - begin
-                break
-        return (None, length, duration)
-
     async def run(self, args):
-        end_length = None
-        end_duration = None
-        if args.duration is not None:
-            golden = self._sequence
-            # TODO if duration * rate < len(_sequence)
-            end_duration = args.duration
-        elif args.until_error:
-            golden = self._sequence
-        else:
-            golden = bytearray()
-            while len(golden) < args.count:
-                golden += self._sequence[:args.count - len(golden)]
-            end_length = args.count
-
-        # These requests are essentially free, as the data and control requests are independent,
-        # both on the FX2 and on the USB bus.
-        # TODO monitor back to counter + make async error thing for sink
-        async def monitor():
-            while True:
-                await asyncio.sleep(0.1)
-                if await bool(self._error):
-                    return
-                count = await self._count
-                if args.duration is not None:
-                    self.logger.debug("transferred %#x", count)
-                else:
-                    self.logger.debug("transferred %#x/%#x", count, args.count)
-
         for mode in args.modes or self.__all_modes:
             if args.duration is not None:
                 length_val = args.duration
                 unit_str = "s"
             else:
-                length_val = len(golden) / (1 << 20)
+                length_val = args.count / (1 << 20)
                 unit_str = "MiB"
             self.logger.info("running benchmark mode %s for %.3f %s",
                              mode, length_val, unit_str)
 
-            if mode in ("source", "sink", "loopback"):
-                if args.rate_mibps is not None:
-                    await self._rate.set(self._mibps_to_rate(args.rate_mibps))
-                    await self._rate_en.set(1)
-                await self._mode.set(Mode[mode.upper()].value)
-                await self._pipe.reset()
-                #print("reset!")
-                asdf = time.time()
-                monitor_fut = asyncio.ensure_future(monitor())
-
-                if mode == "source":
-                    #print("asdf:", time.time() - asdf)
-                    error, length, duration = await self.source_io(golden, end_length, end_duration)
-                    count = 0 # TODO
-                    count = await self._count
-                    #print("ovf: ", await self._overflow)
-
-                # TODO "overflowing after finish (actually good)"
-                if mode == "sink":
-                    error, length, duration = await self.sink_io(golden, end_length, end_duration, monitor_fut)
-                    # TODO error/count
-                    error = bool(await self._error)
-                    count = await self._count
-
-                # TODO 2x rate??
-                if mode == "loopback":
-                    asdf_TODO = await asyncio.gather(
-                        self.source_io(golden, end_length, end_duration),
-                        self.sink_io(golden, end_length, end_duration, monitor_fut)
+            match mode:
+                case "source":
+                    error, length, duration = await self.benchmark_iface.source(
+                        length=args.count, duration=args.duration
                     )
-                    error, length, duration = asdf_TODO[1]
-                    length *= 2
-
-                    count = None
-
-                monitor_fut.cancel()
-
-            if mode == "latency":
-                packetmax = golden[:512]
-                count = 0
-                error = False
-                roundtriptime = []
-
-                await self._rate_en.set(0)
-                await self._mode.set(Mode.LOOPBACK.value)
-                await self._pipe.reset()
-                monitor_fut = asyncio.ensure_future(monitor())
-
-                latency_begin = time.time()
-                while True:
-                    begin = time.perf_counter()
-                    await self._pipe.send(packetmax)
-                    await self._pipe.flush()
-                    actual = await self._pipe.recv(len(packetmax))
-                    end = time.perf_counter()
-
-                    # calculate roundtrip time in µs
-                    roundtriptime.append((end - begin) * 1000000)
-                    if actual != packetmax:
-                        error = True
-                        break
-                    count += len(packetmax) * 2
-
-                    if end_duration is not None:
-                        if end_duration <= time.time() - latency_begin:
-                            break
-                    elif count < args.count:
-                        break
-
-                monitor_fut.cancel()
+                case "sink":
+                    error, length, duration = await self.benchmark_iface.sink(
+                        length=args.count, duration=args.duration
+                    )
+                case "loopback":
+                    error, length, duration = await self.benchmark_iface.loopback(
+                        length=args.count, duration=args.duration
+                    )
+                case "latency":
+                    error, roundtriptime = await self.benchmark_iface.latency(
+                        samples=args.count // (512 * 2), duration=args.duration
+                    )
+                    length = len(roundtriptime) * (512 * 2)
 
             if error:
-                if count is None:
-                    self.logger.error("mode %s failed!", mode)
-                else:
-                    self.logger.error("mode %s failed at %#x!", mode, count)
+                self.logger.error("mode %s failed at %#x!", mode, length)
             else:
                 if mode == "latency":
                     self.logger.info("mode %s: mean: %.2f µs stddev: %.2f µs worst: %.2f µs",
@@ -381,11 +394,6 @@ class BenchmarkApplet(GlasgowAppletV2):
                                  mode,
                                  (length / (duration)) / (1 << 20),
                                  (length / (duration)) / (1 << 17))
-
-    def _mibps_to_rate(self, mibps):
-        ret = round(mibps*(1<<RATE_WIDTH_TODO)/(48)) - 1
-        ret = min(max(ret, 0), (1<<RATE_WIDTH_TODO)-1)
-        return ret
 
     @classmethod
     def tests(cls):
