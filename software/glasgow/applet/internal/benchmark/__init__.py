@@ -4,7 +4,7 @@ import struct
 import array
 import time
 import statistics
-import enum # TODO amaranth enum?
+import enum
 import itertools
 
 from amaranth import *
@@ -152,7 +152,7 @@ class BenchmarkInterface:
         component = assembly.add_submodule(BenchmarkComponent())
         self._pipe = assembly.add_inout_pipe(
             component.o_stream, component.i_stream, in_flush=component.o_flush,
-            out_buffer_size=int(1e6)) # TODO out_buffer_size doesn't act like expected?
+            out_buffer_size=int(100e6)) # TODO out_buffer_size doesn't act like expected?
         self._mode    = assembly.add_rw_register(component.mode)
         self._rate_en = assembly.add_rw_register(component.rate_en)
         self._rate    = assembly.add_rw_register(component.rate)
@@ -165,26 +165,42 @@ class BenchmarkInterface:
             sequence.byteswap()
         self._sequence = sequence.tobytes()
     
-    async def source(self, *, length=None, duration=None):
-        golden = self._make_golden(length)
+    async def source(self, *, length=None, duration=None, rate=None):
+        if length is not None:
+            golden = self._make_golden(length)
+        else:
+            golden = self._sequence
+
         await self._pipe.reset()
+        if rate is not None:
+            await self._rate.set(self._mibps_to_rate(rate))
+            await self._rate_en.set(1)
         await self._mode.set(Mode.SOURCE)
         return await self.source_io(golden, length, duration)
     
-    async def sink(self, *, length=None, duration=None):
-        golden = self._make_golden(length)
+    async def sink(self, *, length=None, duration=None, rate=None):
+        if length is not None:
+            golden = self._make_golden(length)
+        else:
+            golden = self._sequence
+
         await self._pipe.reset()
+        if rate is not None:
+            await self._rate.set(self._mibps_to_rate(rate))
+            await self._rate_en.set(1)
         await self._mode.set(Mode.SINK)
         return await self.sink_io(golden, length, duration)
     
-    async def test(self):
-        await self._mode.set(Mode.SOURCE)
-        print(await self._pipe.send(self._make_golden(10)))
-        print(await self._pipe.send(self._make_golden(10)))
+    async def loopback(self, *, length=None, duration=None, rate=None):
+        if length is not None:
+            golden = self._make_golden(length)
+        else:
+            golden = self._sequence
 
-    async def loopback(self, *, length=None, duration=None):
-        golden = self._make_golden(length)
         await self._pipe.reset()
+        if rate is not None:
+            await self._rate.set(self._mibps_to_rate(rate))
+            await self._rate_en.set(1)
         await self._mode.set(Mode.LOOPBACK)
         result = await asyncio.gather(
             self.source_io(golden, length, duration),
@@ -234,7 +250,7 @@ class BenchmarkInterface:
 
     # These requests are essentially free, as the data and control requests are independent,
     # both on the FX2 and on the USB bus.
-    async def _counter():
+    async def _counter(self):
         while True:
             await asyncio.sleep(0.1)
             count = await self._count
@@ -268,9 +284,9 @@ class BenchmarkInterface:
     
     async def sink_io(self, golden, end_length=None, end_duration=None):
         async def error_monitor():
-            return
             #while not bool(await self._error):
-                #await asyncio.sleep(0.1)
+            while True:
+                await asyncio.sleep(0.1)
         
         monitor_fut = asyncio.ensure_future(error_monitor())
 
@@ -283,7 +299,7 @@ class BenchmarkInterface:
             if monitor_fut.done():
                 # TODO what goes here?
                 break
-            elif end_length is not None and end_length <= length:
+            if end_length is not None and end_length <= length:
                 await self._pipe.flush()
                 duration = time.time() - begin
                 break
@@ -353,6 +369,7 @@ class BenchmarkApplet(GlasgowAppletV2):
     async def run(self, args):
         for mode in args.modes or self.__all_modes:
             if args.duration is not None:
+                args.count = None
                 length_val = args.duration
                 unit_str = "s"
             else:
@@ -364,15 +381,15 @@ class BenchmarkApplet(GlasgowAppletV2):
             match mode:
                 case "source":
                     error, length, duration = await self.benchmark_iface.source(
-                        length=args.count, duration=args.duration
+                        length=args.count, duration=args.duration, rate=args.rate_mibps
                     )
                 case "sink":
                     error, length, duration = await self.benchmark_iface.sink(
-                        length=args.count, duration=args.duration
+                        length=args.count, duration=args.duration, rate=args.rate_mibps
                     )
                 case "loopback":
                     error, length, duration = await self.benchmark_iface.loopback(
-                        length=args.count, duration=args.duration
+                        length=args.count, duration=args.duration, rate=args.rate_mibps
                     )
                 case "latency":
                     error, roundtriptime = await self.benchmark_iface.latency(
